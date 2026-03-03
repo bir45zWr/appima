@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: imatoy-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: SUPABASE_URL
+        value: https://owfiiqyimnxalgissulj.supabase.co
+      - key: SUPABASE_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im93ZmlpcXlpbW54YWxnaXNzdWxqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjUzNjU5MywiZXhwIjoyMDg4MTEyNTkzfQ.WCOG2gE5AJXeS4pvUrbOd63t9GKyh8K-swHUe4WxBQY
+      - key: JWT_SECRET
+        value: imatoy_super_secret_jwt_key_2024_xK9mP3nQ7rL2vB8
+      - key: AUTO_REGISTER_KEY
+        value: imatoy_auto_register_secret_2024
+      - key: JWT_EXPIRE_DAYS
+        value: 30
