@@ -28,18 +28,18 @@ from jose import jwt, JWTError
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG — Render.com pe Environment Variables set karo
 # ═══════════════════════════════════════════════════════════════════
-SUPABASE_URL      = os.getenv("SUPABASE_URL",      "https://owfiiqyimnxalgissulj.supabase.co")
-SUPABASE_KEY      = os.getenv("SUPABASE_KEY",      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im93ZmlpcXlpbW54YWxnaXNzdWxqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjUzNjU5MywiZXhwIjoyMDg4MTEyNTkzfQ.WCOG2gE5AJXeS4pvUrbOd63t9GKyh8K-swHUe4WxBQY")
-JWT_SECRET        = os.getenv("JWT_SECRET",        "imatoy_super_secret_jwt_key_2024_xK9mP3nQ7rL2vB8")
-AUTO_REGISTER_KEY = os.getenv("AUTO_REGISTER_KEY", "imatoy_auto_register_secret_2024")
-JWT_EXPIRE_DAYS   = int(os.getenv("JWT_EXPIRE_DAYS", "30"))
-PORT              = int(os.getenv("PORT", "10000"))
-UPLOAD_DIR        = os.getenv("UPLOAD_DIR", "/tmp/imatoy_uploads")
+SUPABASE_URL      = "https://owfiiqyimnxalgissulj.supabase.co"
+SUPABASE_KEY      = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im93ZmlpcXlpbW54YWxnaXNzdWxqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjUzNjU5MywiZXhwIjoyMDg4MTEyNTkzfQ.WCOG2gE5AJXeS4pvUrbOd63t9GKyh8K-swHUe4WxBQY"
+JWT_SECRET        = "imatoy_super_secret_jwt_key_2024_xK9mP3nQ7rL2vB8"
+AUTO_REGISTER_KEY = "imatoy_auto_register_secret_2024"
+JWT_EXPIRE_DAYS   = 30
+PORT              = int(os.getenv("PORT", "10000"))   # Render PORT env var zaruri hai
+UPLOAD_DIR        = "/tmp/imatoy_uploads"
 ALGORITHM         = "HS256"
 
 # Metered.ca TURN Server (WebRTC ke liye)
-METERED_API_KEY   = os.getenv("METERED_API_KEY", "zYgB3VGSmsAw470kDmr-yt4oyngLEyVXDT7d2mF97POUDiwr")
-METERED_DOMAIN    = os.getenv("METERED_DOMAIN",  "imatoy.metered.live")
+METERED_API_KEY   = "zYgB3VGSmsAw470kDmr-yt4oyngLEyVXDT7d2mF97POUDiwr"
+METERED_DOMAIN    = "imatoy.metered.live"
 
 # Upload directories
 for d in ["media", "screenshots", "audio", "recordings"]:
