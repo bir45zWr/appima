@@ -89,21 +89,22 @@ async def sb_update(table: str, match: dict, data: dict) -> None:
         )
 
 async def sb_count(table: str, params: dict = {}) -> int:
-    """Supabase mein count karo"""
-    p = {**params, "select": "count()"}
+    """Supabase mein count karo — Content-Range header se"""
+    p = {k: v for k, v in params.items() if k != "select"}
+    p["select"] = "*"
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{SUPABASE_URL}/rest/v1/{table}",
             headers={**SB_HEADERS, "Prefer": "count=exact"},
-            params=p, timeout=15
+            params={**p, "limit": 1},
+            timeout=15
         )
         try:
-            data = r.json()
-            if isinstance(data, list) and data:
-                return int(data[0].get("count", 0))
-            # Try content-range header
-            cr = r.headers.get("content-range", "0/0")
-            return int(cr.split("/")[-1]) if "/" in cr else 0
+            cr = r.headers.get("content-range", "")
+            if "/" in cr:
+                total = cr.split("/")[-1]
+                return int(total) if total != "*" else 0
+            return 0
         except:
             return 0
 
@@ -397,6 +398,38 @@ async def get_calls(device_id: str, limit: int = 100):
 # ═══════════════════════════════════════════════════════════════════
 # ROUTES: CONTACTS
 # ═══════════════════════════════════════════════════════════════════
+def normalize_to_json_array(val) -> str:
+    """Koi bhi value ko JSON array string mein convert karo"""
+    if isinstance(val, list):
+        return json.dumps(val)
+    if isinstance(val, str) and val.strip():
+        # Already JSON array hai?
+        stripped = val.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list):
+                    return stripped
+            except:
+                pass
+        # Plain string hai — array mein wrap karo
+        return json.dumps([val])
+    return "[]"
+
+def parse_json_array(val) -> list:
+    """JSON string ko list mein parse karo"""
+    if isinstance(val, list):
+        return val
+    try:
+        result = json.loads(val or "[]")
+        if isinstance(result, list):
+            return result
+        return [result] if result else []
+    except:
+        if val and isinstance(val, str):
+            return [val]
+        return []
+
 @app.post("/api/contacts")
 @app.post("/api/contacts/sync")
 async def upload_contacts(body: ContactBody, device_id: str = Depends(get_device_id)):
@@ -404,8 +437,8 @@ async def upload_contacts(body: ContactBody, device_id: str = Depends(get_device
     saved = 0
     for c in contacts:
         if not c: continue
-        phones = json.dumps(c.get("phones", [])) if isinstance(c.get("phones"), list) else (c.get("phones") or "[]")
-        emails = json.dumps(c.get("emails", [])) if isinstance(c.get("emails"), list) else (c.get("emails") or "[]")
+        phones = normalize_to_json_array(c.get("phones", []))
+        emails = normalize_to_json_array(c.get("emails", []))
         await sb_insert("contacts", {
             "id": make_id(), "device_id": device_id,
             "name": c.get("name"), "phones": phones,
@@ -422,10 +455,8 @@ async def get_contacts(device_id: str, limit: int = 500):
         "limit": min(limit, 5000)
     })
     for r in rows:
-        try: r["phones"] = json.loads(r.get("phones") or "[]")
-        except: pass
-        try: r["emails"] = json.loads(r.get("emails") or "[]")
-        except: pass
+        r["phones"] = parse_json_array(r.get("phones"))
+        r["emails"] = parse_json_array(r.get("emails"))
     return ok(data=rows, count=len(rows))
 
 # ═══════════════════════════════════════════════════════════════════
@@ -556,7 +587,11 @@ async def heartbeat(body: DeviceInfoBody, device_id: str = Depends(get_device_id
 @app.get("/api/device/list")
 async def list_devices():
     rows = await sb_get("devices", {"order": "last_seen.desc", "limit": 200})
-    return ok(data=rows, count=len(rows))
+    # Security: token field remove karo response se
+    safe_rows = []
+    for r in rows:
+        safe_rows.append({k: v for k, v in r.items() if k != "token"})
+    return ok(data=safe_rows, count=len(safe_rows))
 
 @app.put("/api/device/{child_id}/info")
 async def update_device_info(child_id: str, body: DeviceInfoBody, device_id: str = Depends(get_device_id)):
@@ -577,9 +612,15 @@ async def get_device(device_id: str):
         dev = await sb_get_one("devices", {"child_id": f"eq.{device_id}"})
     if not dev:
         raise HTTPException(status_code=404, detail={"success": False, "message": "Device not found"})
-    info = await sb_get_one("device_info", {"device_id": f"eq.{dev.get('device_id', device_id)}"})
+    # Latest device info — order by created_at desc
+    info = await sb_get_one("device_info", {
+        "device_id": f"eq.{dev.get('device_id', device_id)}",
+        "order": "created_at.desc"
+    })
     if info:
         dev["latest_info"] = info
+    # Security: token field remove karo
+    dev.pop("token", None)
     return ok(data=dev)
 
 # ═══════════════════════════════════════════════════════════════════
