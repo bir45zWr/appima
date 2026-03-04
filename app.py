@@ -974,23 +974,28 @@ async def ws_signal(websocket: WebSocket, device_id: str, role: str = "child"):
         print(f"Signal WS error [{device_id[:8]}]: {e}")
         ws_manager.disconnect("signal", device_id, websocket, role)
 
-# ─── REST: TURN Credentials (Metered.ca) ────────────────────────────
+# ─── REST: TURN Credentials (Metered.ca + Google STUN fallback) ─────
 @app.get("/api/turn/credentials")
 async def get_turn_credentials():
     """
     Metered.ca TURN server credentials fetch karo.
-    Flutter/Browser mein WebRTC ke liye use karo.
-    API key server pe safe rehti hai — client ko expose nahi hoti.
+    Agar Metered.ca fail ho toh Google STUN servers use karo (fallback).
 
-    Response:
-    {
-      "iceServers": [
-        {"urls": "stun:imatoy.metered.live:80"},
-        {"urls": "turn:imatoy.metered.live:80", "username": "...", "credential": "..."},
-        ...
-      ]
-    }
+    Render Dashboard pe set karo:
+      METERED_API_KEY = your_metered_api_key
+      METERED_DOMAIN  = yourapp.metered.live
     """
+    # Google STUN fallback (hamesha kaam karta hai — free)
+    google_stun = [
+        {"urls": "stun:stun.l.google.com:19302"},
+        {"urls": "stun:stun1.l.google.com:19302"},
+        {"urls": "stun:stun2.l.google.com:19302"},
+    ]
+
+    # Agar API key set nahi hai ya default invalid key hai
+    if not METERED_API_KEY or METERED_API_KEY == "YOUR_METERED_API_KEY":
+        return ok(data={"iceServers": google_stun, "source": "google_stun_fallback"})
+
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
@@ -998,16 +1003,43 @@ async def get_turn_credentials():
                 params={"apiKey": METERED_API_KEY},
                 timeout=10
             )
-            ice_servers = r.json()
-            return ok(data={"iceServers": ice_servers})
+            result = r.json()
+
+            # Metered.ca error check — "Invalid API Key" ya koi aur error
+            if isinstance(result, dict) and "error" in result:
+                # Metered.ca ne error diya — Google STUN use karo
+                return ok(data={
+                    "iceServers": google_stun,
+                    "source": "google_stun_fallback",
+                    "metered_error": result.get("error", "Unknown error")
+                })
+
+            # Metered.ca se valid ICE servers mila
+            if isinstance(result, list) and len(result) > 0:
+                return ok(data={"iceServers": result, "source": "metered"})
+
+            # Empty response — fallback
+            return ok(data={"iceServers": google_stun, "source": "google_stun_fallback"})
+
     except Exception as e:
-        # Fallback: Google STUN server
+        # Network error — Google STUN fallback
         return ok(data={
-            "iceServers": [
-                {"urls": "stun:stun.l.google.com:19302"},
-                {"urls": "stun:stun1.l.google.com:19302"},
-            ]
-        }, warning=str(e))
+            "iceServers": google_stun,
+            "source": "google_stun_fallback",
+            "error": str(e)
+        })
+
+@app.get("/api/turn/debug")
+async def turn_debug():
+    """Debug: TURN config check karo (domain aur key masked)"""
+    key = METERED_API_KEY or ""
+    masked_key = key[:8] + "..." + key[-4:] if len(key) > 12 else "NOT_SET"
+    return ok(data={
+        "metered_domain": METERED_DOMAIN,
+        "metered_api_key_masked": masked_key,
+        "api_key_length": len(key),
+        "api_url": f"https://{METERED_DOMAIN}/api/v1/turn/credentials"
+    })
 
 # ─── REST: WebSocket Status ──────────────────────────────────────────
 @app.get("/api/ws/status/{device_id}")
