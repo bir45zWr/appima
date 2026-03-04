@@ -38,8 +38,9 @@ UPLOAD_DIR        = "/tmp/imatoy_uploads"
 ALGORITHM         = "HS256"
 
 # Metered.ca TURN Server (WebRTC ke liye)
-METERED_API_KEY   = "zYgB3VGSmsAw470kDmr-yt4oyngLEyVXDT7d2mF97POUDiwr"
-METERED_DOMAIN    = "imatoy.metered.live"
+# Render Dashboard → Environment Variables mein set karo: METERED_API_KEY
+METERED_API_KEY   = os.getenv("METERED_API_KEY", "zYgB3VGSmsAw470kDmr-yt4oyngLEyVXDT7d2mF97POUDiwr")
+METERED_DOMAIN    = os.getenv("METERED_DOMAIN",  "imatoy.metered.live")
 
 # Upload directories
 for d in ["media", "screenshots", "audio", "recordings"]:
