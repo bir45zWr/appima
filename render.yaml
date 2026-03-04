@@ -3,7 +3,7 @@ services:
     name: imatoy-backend
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: python server.py
     envVars:
       - key: PORT
         value: 10000
@@ -17,3 +17,7 @@ services:
         value: imatoy_auto_register_secret_2024
       - key: JWT_EXPIRE_DAYS
         value: 30
+      - key: METERED_API_KEY
+        value: zYgB3VGSmsAw470kDmr-yt4oyngLEyVXDT7d2mF97POUDiwr
+      - key: METERED_DOMAIN
+        value: imatoy.metered.live
